@@ -1,10 +1,10 @@
 # DePrado Dollar Pipeline
 
-**Alpha Factory industrielle basée sur les travaux de Marcos López de Prado (2018). Pipeline ETL complet : échantillonnage par Dollar Bars, labeling Triple Barrière, stationnarité via différentiation fractionnaire. Validation sur XAUUSD 2010–2025 : compression de 4139 barres D1 à 664 Dollar Bars, Jarque-Bera de 4509 à 1545. Optimisé Numba (JIT).**
+**Alpha Factory industrielle basée sur les travaux de Marcos López de Prado (2018). Pipeline ETL complet : échantillonnage par Dollar Bars, labeling Triple Barrière, stationnarité via différentiation fractionnaire. Validation sur XAUUSD 2010–2025 : 4139 barres D1 → 1883 Dollar Bars (threshold auto 1:1 ; ajustable via `--target-bars` / `--multiplier`). Implémentation NumPy/pandas pure (aucune dépendance de compilation).**
 
 ```
 pip install numpy pandas scikit-learn matplotlib scipy yfinance
-python pipe.py
+python DePrado-Dollar-Pipeline.py
 ```
 
 Une commande. Le pipeline télécharge les données, construit les dollar bars, génère les features, entraîne un meta-model en walk-forward, produit un backtest net de coûts et livre un dashboard HTML.
@@ -19,12 +19,12 @@ Une commande. Le pipeline télécharge les données, construit les dollar bars, 
 | Ch.2.5 | `cusum_filter` | Filtre CUSUM symétrique. Détection d'événements structurels, threshold auto par écart-type des log-rendements |
 | Ch.3 | `triple_barrier` | Labeling TP/SL/Time calibré par volatilité locale. Barrières asymétriques paramétrables |
 | Ch.3.6 | `meta_label` | Le signal primaire donne la direction, le RF apprend *quand* ce signal est fiable |
-| Ch.4 | `sample_weights` | Pondération par unicité (average uniqueness) × amplitude du rendement |
+| Ch.4 | `causal_sample_weights` | Pondération par unicité *causale* (concurrence des events passés uniquement, sans fuite future) × amplitude du rendement |
 | Ch.5 | `frac_diff_ffd` | Fixed-width window FFD. Stationnarité avec mémoire longue (d=0.4) |
 | Ch.7 | `PurgedKFoldCV` | K-Fold avec purge temporel + embargo. Élimine le look-ahead bias |
 | Ch.8 | `mda_importance` | Mean Decrease Accuracy par permutation. Élagage automatique des features bruit |
 | Ch.10 | `bet_size` | Dimensionnement par transformation CDF de la probabilité du meta-model |
-| Ch.11 | `CombPurgedCV` | C(N,k) chemins de backtest combinatoires avec purge |
+| Ch.11 | `CombPurgedCV` | C(N,k) chemins de backtest combinatoires avec purge + embargo. Backtest OOS par chemin → distribution de Sharpe et t-stat de robustesse |
 | Ch.14 | `deflated_sharpe` | Test de significativité du Sharpe ajusté pour le multiple testing |
 | Ch.17 | `sadf` | Supreme ADF — détection de régimes de bulle |
 | Ch.18 | `entropy_features` | Shannon, plug-in, Lempel-Ziv sur log-rendements |
@@ -39,7 +39,7 @@ Momentum pur à 20 jours :
 side = sign(close[t] / close[t-20] - 1)
 ```
 
-Le meta-model Random Forest décide si ce signal est fiable dans le contexte courant (volatilité, entropie, régime SADF, fractional diff). Le MDA pruning (Ch.8) élague automatiquement les features non contributives — typiquement 4 features retenues sur 8.
+Le meta-model Random Forest décide si ce signal est fiable dans le contexte courant (volatilité, entropie, régime SADF, fractional diff). Le MDA pruning (Ch.8) élague les features à importance négative : il ne conserve l'ensemble réduit que s'il reste au moins 3 features positives, sinon les 8 sont gardées. Le nombre retenu dépend du dataset.
 
 ---
 
@@ -72,15 +72,15 @@ Les futures (GC=F, CL=F) ont un volume Yahoo Finance erratique. Les ETF (GLD, SP
 
 | Commande | Description |
 |----------|-------------|
-| `python pipe.py` | Clé en main : GLD, signal + backtest + dashboard |
-| `python pipe.py --fetch SPY` | Autre ticker |
-| `python pipe.py --fetch BTC` | Crypto |
-| `python pipe.py data.csv` | CSV local (OHLCV) |
-| `python pipe.py --research` | CPCV, MDA, rapports de distribution |
-| `python pipe.py --daily` | Mode cron incrémental |
-| `python pipe.py --optimize --n-iter 100` | Random search + Deflated Sharpe |
-| `python pipe.py --start 2015-01-01` | Période personnalisée |
-| `python pipe.py --tf h4 d1 w1` | Multi-timeframe séquentiel |
+| `python DePrado-Dollar-Pipeline.py` | Clé en main : GLD, signal + backtest + dashboard |
+| `python DePrado-Dollar-Pipeline.py --fetch SPY` | Autre ticker |
+| `python DePrado-Dollar-Pipeline.py --fetch BTC` | Crypto |
+| `python DePrado-Dollar-Pipeline.py data.csv` | CSV local (OHLCV) |
+| `python DePrado-Dollar-Pipeline.py --research` | CPCV, MDA, rapports de distribution |
+| `python DePrado-Dollar-Pipeline.py --daily` | Mode cron incrémental |
+| `python DePrado-Dollar-Pipeline.py --optimize --n-iter 100` | Random search + Deflated Sharpe |
+| `python DePrado-Dollar-Pipeline.py --start 2015-01-01` | Période personnalisée |
+| `python DePrado-Dollar-Pipeline.py --tf h4 d1 w1` | Multi-timeframe séquentiel |
 
 ---
 
@@ -93,7 +93,7 @@ Les futures (GC=F, CL=F) ont un volume Yahoo Finance erratique. Les ETF (GLD, SP
 | `backtest_trades.csv` | P&L par trade avec décomposition des coûts |
 | `signal_meta.json` | Configuration pipeline + statistiques backtest |
 | `dashboard.html` | Dashboard interactif (equity, drawdown, P&L, trades) |
-| `distribution_report.png` | Distribution des rendements, labels, SADF, weights |
+| `distribution_report.png` | Distribution des rendements, labels, SADF, weights (mode `--research` uniquement) |
 | `optimize_results.json` | Meilleurs paramètres + DSR (mode optimize) |
 
 ---
@@ -104,22 +104,26 @@ Les futures (GC=F, CL=F) ont un volume Yahoo Finance erratique. Les ETF (GLD, SP
 
 | Métrique | Time Bars | Dollar Bars |
 |----------|-----------|-------------|
-| Barres | 4139 | 664 |
-| Jarque-Bera | 4509 | 1545 |
+| Barres | 4139 | 1883 |
+| Jarque-Bera | 4509 | 2387 |
 
-### GLD 2020–2026 (walk-forward, net de coûts)
+### XAUUSD 2010–2025 (walk-forward, net de coûts)
+
+Résultats reproductibles via `python DePrado-Dollar-Pipeline.py XAUUSD_Complete_Dataset_2010_2025.csv --signal --tf d1` (Sharpe annualisé par fréquence réelle des trades, coûts pondérés par la taille de position) :
 
 | Métrique | Valeur |
 |----------|--------|
-| Sharpe | 2.26 |
-| Return | +11.64% |
-| Max Drawdown | -4.35% |
-| Calmar | 2.68 |
-| Win Rate | 61.8% |
-| Profit Factor | 1.46 |
-| Trades | 131 |
-| Avg Hold | 3 jours |
-| Features retenues (MDA) | 4 / 8 |
+| Sharpe | 0.31 |
+| Return | +12.68% |
+| Max Drawdown | -12.50% |
+| Calmar | 1.01 |
+| Win Rate | 46.9% |
+| Profit Factor | 1.24 |
+| Trades | 307 |
+| Avg Hold | 3.3 jours |
+| Samples (walk-forward) | 531 |
+
+> Note : la robustesse n'est **pas** établie. La CPCV 6/2 (`--research`) donne 53% de chemins OOS positifs et un t-stat ≈ 0.4 sur la moyenne des chemins — un edge statistiquement indistinct de zéro. Ces chiffres valident le pipeline, pas une stratégie profitable.
 
 ---
 
@@ -149,7 +153,7 @@ Les futures (GC=F, CL=F) ont un volume Yahoo Finance erratique. Les ETF (GLD, SP
 ## Paramètres avancés
 
 ```bash
-python pipe.py data.csv \
+python DePrado-Dollar-Pipeline.py data.csv \
   --tf d1 \
   --horizon 10 \
   --momentum 20 \
